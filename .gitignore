@@ -1,0 +1,16 @@
+# Credentials: Wi-Fi password, Spotify client secret, refresh token
+secrets.h
+
+# Build output (arduino-cli --output-dir / --export-binaries)
+build/
+*.bin
+*.elf
+*.map
+
+# Backups
+*.bak*
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
