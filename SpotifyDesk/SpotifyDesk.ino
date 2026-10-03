@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <WiFiManager.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -30,8 +32,9 @@ const int BAR_W = 6, BAR_GAP = 4, BAR_COUNT = (TEXT_W + BAR_GAP) / (BAR_W + BAR_
 const uint32_t WAVE_FRAME_MS = 80;
 const uint32_t POLL_MS = 5000;
 const uint16_t TOUCH_Z_MIN = 600;  // raw touch pressure that counts as a tap
-// The ESP32's BOOT button (GPIO 0) switches pages, for when touch isn't wired,
-// and adds a Wi-Fi network when held during boot
+// The ESP32's BOOT button (GPIO 0) switches pages, for when touch isn't wired.
+// Held for 1.5 s it shows the Spotify account page; held during boot, it adds a
+// Wi-Fi network
 const int BOOT_BUTTON = 0;
 
 TFT_eSPI tft;
@@ -40,15 +43,16 @@ TFT_eSPI tft;
 SemaphoreHandle_t tftLock;
 TaskHandle_t spotifyTaskHandle;
 
-enum Page : uint8_t { PAGE_NOW_PLAYING, PAGE_GIF };
+enum Page : uint8_t { PAGE_NOW_PLAYING, PAGE_GIF, PAGE_ACCOUNT };
 volatile Page page = PAGE_NOW_PLAYING;  // only loop() changes it, under tftLock
 volatile bool forceRedraw = false;      // back on the now-playing page; redraw everything
 volatile bool gifPageDirty = false;     // song or BPM changed while on the GIF page
 
 const char* SETUP_AP = "DeskPlayer-Setup";
 const int PORTAL_TIMEOUT_S = 180;
+const char* SPOTIFY_REDIRECT = "http://127.0.0.1:8888/callback";  // must match the Spotify app
 Preferences prefs;
-String refreshToken;  // entered in the setup portal, kept in flash
+String refreshToken;  // from the Spotify sign-in page, kept in flash
 
 // Every network set up through the portal is kept (newest first, oldest dropped
 // past MAX_NETWORKS), and the board joins whichever of them is in range
@@ -96,6 +100,12 @@ bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
 // Centred status text on a black screen, for boot and Wi-Fi setup
 void showStatus(const String& heading, const String& detail, const String& hint) {
   xSemaphoreTake(tftLock, portMAX_DELAY);
+  drawStatus(heading, detail, hint);
+  xSemaphoreGive(tftLock);
+}
+
+// Same, for callers already holding tftLock
+void drawStatus(const String& heading, const String& detail, const String& hint) {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   String lines[4];
@@ -116,7 +126,6 @@ void showStatus(const String& heading, const String& detail, const String& hint)
   n = wrapText(hint, TEXT_W, 4, lines);
   for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
   tft.setTextDatum(TL_DATUM);
-  xSemaphoreGive(tftLock);
 }
 
 void loadNetworks() {
@@ -154,14 +163,180 @@ void rememberNetwork(const String& ssid, const String& pass) {
   Serial.printf("Saved Wi-Fi network %s (%d saved)\n", ssid.c_str(), n);
 }
 
+void restartAfterTimeout() {
+  Serial.println("Wi-Fi setup timed out; restarting");
+  showStatus("Setup timed out", "", "Restarting...");
+  delay(2000);
+  ESP.restart();
+}
+
+// Swap the one-time code from Spotify's sign-in page for a refresh token
+bool exchangeAuthCode(const String& code) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://accounts.spotify.com/api/token");
+  http.setAuthorization(SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int status = http.POST("grant_type=authorization_code&code=" + urlEncode(code) +
+                         "&redirect_uri=" + urlEncode(SPOTIFY_REDIRECT));
+  String body = http.getString();
+  http.end();
+  JsonDocument doc;
+  if (status != 200 || deserializeJson(doc, body) || !doc["refresh_token"].is<const char*>()) {
+    Serial.printf("Spotify sign-in failed: %d %s\n", status, body.c_str());
+    return false;
+  }
+  refreshToken = doc["refresh_token"].as<String>();
+  prefs.putString("refresh", refreshToken);
+  accessToken = doc["access_token"].as<String>();
+  tokenTtlMs = (doc["expires_in"] | 3600) * 1000UL - 60000;
+  tokenFetchedAt = millis();
+  Serial.println("Signed in to Spotify; saved the refresh token");
+  return true;
+}
+
+// Takes the address Spotify's sign-in ended on (with ?code=), or a refresh
+// token. Returns what went wrong, or "" once a new account is saved.
+String applySpotifyEntry(String entry) {
+  entry.trim();
+  if (entry.isEmpty()) return "Paste the address first";
+  if (entry.indexOf("error=") >= 0) return "Spotify sign-in was cancelled";
+  int i = entry.indexOf("code=");
+  if (i >= 0) {
+    String code = entry.substring(i + 5);
+    int stop = code.indexOf('&');
+    if (stop >= 0) code = code.substring(0, stop);
+    stop = code.indexOf('#');
+    if (stop >= 0) code = code.substring(0, stop);
+    return exchangeAuthCode(code) ? "" : "Spotify sign-in failed. Tap Sign in again for a new address";
+  }
+  if (entry.startsWith("http")) return "That address has no Spotify sign-in code";
+  refreshToken = entry;
+  prefs.putString("refresh", refreshToken);
+  Serial.println("Saved new Spotify refresh token");
+  return "";
+}
+
+String htmlEscape(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  return s;
+}
+
+String spotifyPage(const String& message) {
+  String signInUrl = "https://accounts.spotify.com/authorize?client_id=" + String(SPOTIFY_CLIENT_ID) +
+                     "&amp;response_type=code&amp;scope=user-read-currently-playing&amp;show_dialog=true" +
+                     "&amp;redirect_uri=" + urlEncode(SPOTIFY_REDIRECT);
+  String page =
+      "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+      "<title>DeskPlayer Spotify</title><style>"
+      "body{font-family:-apple-system,sans-serif;max-width:480px;margin:auto;padding:16px;background:#121212;color:#eee}"
+      ".btn{display:block;box-sizing:border-box;width:100%;text-align:center;padding:14px;border:0;border-radius:24px;"
+      "font-size:18px;font-weight:600;text-decoration:none;background:#1DB954;color:#000}"
+      ".alt{background:#333;color:#eee;margin-top:24px}"
+      "textarea{width:100%;box-sizing:border-box;height:90px;font-size:15px;border-radius:8px;padding:8px}"
+      ".err{background:#5a1d1d;padding:10px;border-radius:8px}</style></head><body>"
+      "<h2>Connect Spotify</h2>";
+  if (message.length()) page += "<p class='err'>" + htmlEscape(message) + "</p>";
+  if (refreshToken.length()) page += "<p>This display already has a Spotify account. Signing in here replaces it.</p>";
+  page +=
+      "<p><b>1.</b> Tap the button, sign in, and tap <b>Agree</b>.</p>"
+      "<a class='btn' href='" + signInUrl + "' target='_blank'>Sign in to Spotify</a>"
+      "<p><b>2.</b> The page after that <b>won't load. That's expected.</b> Copy its whole address "
+      "(it starts with http://127.0.0.1), come back to this tab, and paste it here:</p>"
+      "<form method='post' action='/'><textarea name='code' autocapitalize='none' autocorrect='off' "
+      "placeholder='http://127.0.0.1:8888/callback?code=...'></textarea>"
+      "<p><button class='btn' type='submit'>3. Finish</button></p></form>";
+  return page + "</body></html>";
+}
+
+// The Spotify sign-in page is served on the home network all the time, at
+// http://deskplayer.local or the board's IP, so the account can be switched
+// whenever. loop() answers the phone; spotifyTask does the actual sign-in,
+// since it's the only task that touches the tokens.
+WebServer server(80);
+enum SignIn : uint8_t { SIGNIN_IDLE, SIGNIN_PENDING, SIGNIN_DONE, SIGNIN_FAILED };
+volatile SignIn signIn = SIGNIN_IDLE;
+String signInEntry, signInError;
+
+const char* PAGE_STYLE =
+    "<meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:"
+    "-apple-system,sans-serif;max-width:480px;margin:auto;padding:16px;background:#121212;color:#eee'>";
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() { server.send(200, "text/html", spotifyPage("")); });
+  server.on("/", HTTP_POST, []() {
+    if (signIn != SIGNIN_PENDING) {
+      signInEntry = server.arg("code");
+      signIn = SIGNIN_PENDING;
+      xTaskNotifyGive(spotifyTaskHandle);
+    }
+    server.sendHeader("Location", "/wait");
+    server.send(303);
+  });
+  server.on("/wait", []() {
+    if (signIn == SIGNIN_PENDING) {
+      server.send(200, "text/html", String(PAGE_STYLE) + "<meta http-equiv='refresh' content='1'><h2>Signing in...</h2>");
+    } else if (signIn == SIGNIN_FAILED) {
+      server.send(200, "text/html", spotifyPage(signInError));
+    } else {
+      server.send(200, "text/html", String(PAGE_STYLE) + "<h2>Done</h2><p>Spotify is connected. "
+                                                         "Play something and it shows up on the display.</p>");
+    }
+  });
+  server.onNotFound([]() {
+    server.sendHeader("Location", "/");
+    server.send(302);
+  });
+  MDNS.begin("deskplayer");
+  MDNS.addService("http", "tcp", 80);
+  server.begin();
+  Serial.printf("Spotify page: http://%s or http://deskplayer.local\n", WiFi.localIP().toString().c_str());
+}
+
+// Runs on spotifyTask
+void handleSignIn() {
+  if (signIn != SIGNIN_PENDING) return;
+  String error = applySpotifyEntry(signInEntry);
+  if (error.isEmpty()) {
+    // New account: drop the old one's song so the screen redraws from scratch
+    bpmKey = "";
+    forceRedraw = true;
+    signIn = SIGNIN_DONE;
+    if (page == PAGE_ACCOUNT) switchPage();
+  } else {
+    signInError = error;
+    signIn = SIGNIN_FAILED;
+  }
+}
+
+// Shows where to find the Spotify page; caller holds tftLock
+void drawAccountPage() {
+  bool hasAccount = refreshToken.length();
+  drawStatus(hasAccount ? "Switch Spotify account" : "Sign in to Spotify", WiFi.localIP().toString(),
+             String("On your phone, on the same Wi-Fi, open this address (or deskplayer.local).") +
+                 (hasAccount ? " Press BOOT to go back." : ""));
+}
+
+void showAccountPage() {
+  xSemaphoreTake(tftLock, portMAX_DELAY);
+  closeGif();
+  page = PAGE_ACCOUNT;
+  drawAccountPage();
+  xSemaphoreGive(tftLock);
+}
+
 // Joins whichever saved network is in range. If none is, or addNetwork is set,
-// opens the DeskPlayer-Setup hotspot with a captive portal for adding a network
-// and entering the Spotify refresh token. Restarts if nobody finishes setup
-// within PORTAL_TIMEOUT_S; the saved networks are kept either way.
+// opens the DeskPlayer-Setup hotspot with a captive portal for adding a network;
+// tapping Exit there keeps the saved ones. Restarts if nobody finishes within
+// PORTAL_TIMEOUT_S. Then asks for a Spotify sign-in if there's no account yet,
+// or offers to switch accounts when the button was held.
 void setupWiFi(bool addNetwork) {
   WiFiManager wm;
-  WiFiManagerParameter tokenParam("token", "Spotify refresh token (blank keeps the saved one)", "", 256);
-  wm.addParameter(&tokenParam);
+  std::vector<const char*> menu = {"wifi", "exit"};
+  wm.setMenu(menu);
   wm.setConfigPortalTimeout(PORTAL_TIMEOUT_S);
   wm.setConnectTimeout(15);
   wm.setConnectRetries(3);  // the router sometimes refuses the first attempt
@@ -169,7 +344,7 @@ void setupWiFi(bool addNetwork) {
     WiFi.setTxPower(WIFI_POWER_8_5dBm);
     Serial.printf("Setup portal open: join %s, then browse to %s\n", SETUP_AP, WiFi.softAPIP().toString().c_str());
     showStatus("Connect to DeskPlayer-Setup on your phone", "",
-               "Pick your Wi-Fi network and enter your Spotify refresh token. Closes in 3 minutes.");
+               "Then tap Configure WiFi and pick your network. Closes in 3 minutes.");
   });
 
   WiFi.mode(WIFI_STA);
@@ -185,28 +360,15 @@ void setupWiFi(bool addNetwork) {
     // Nothing saved in range: try the network WiFiManager last used, then the portal
     if (!ok) ok = wm.autoConnect(SETUP_AP);
   }
-  // Saved network worked but there's no token yet: open the portal to ask for it
-  if (ok && refreshToken.isEmpty() && strlen(tokenParam.getValue()) == 0) {
-    Serial.println("No Spotify refresh token saved; opening the setup portal");
-    ok = wm.startConfigPortal(SETUP_AP);
+  if (!ok && savedCount) {  // portal exited or timed out: fall back to a saved network
+    showStatus("Connecting to Wi-Fi...", "", "");
+    WiFi.mode(WIFI_STA);
+    ok = wifiMulti.run(15000) == WL_CONNECTED;
   }
-  if (!ok) {
-    Serial.println("Wi-Fi setup timed out; restarting");
-    showStatus("Setup timed out", "", "Restarting...");
-    delay(2000);
-    ESP.restart();
-  }
+  if (!ok) restartAfterTimeout();
   WiFi.setTxPower(WIFI_POWER_8_5dBm);
   WiFi.setAutoReconnect(true);
   rememberNetwork(WiFi.SSID(), WiFi.psk());
-
-  String token = tokenParam.getValue();
-  token.trim();
-  if (token.length() && token != refreshToken) {
-    refreshToken = token;
-    prefs.putString("refresh", refreshToken);
-    Serial.println("Saved new Spotify refresh token");
-  }
 
   String ip = WiFi.localIP().toString();
   Serial.printf("Connected to %s, IP %s\n", WiFi.SSID().c_str(), ip.c_str());
@@ -515,6 +677,7 @@ void fetchNowPlaying() {
     currentArtUrl = "";
     lastInfo = "";
   }
+  if (refreshToken.isEmpty()) return;  // waiting for the Spotify page
   if (!tokenValid() && !refreshAccessToken()) return;
 
   WiFiClientSecure client;
@@ -734,6 +897,10 @@ void playGifFrame() {
 
 void switchPage() {
   xSemaphoreTake(tftLock, portMAX_DELAY);
+  if (page == PAGE_ACCOUNT && refreshToken.isEmpty()) {
+    xSemaphoreGive(tftLock);  // nothing to go back to yet
+    return;
+  }
   if (page == PAGE_NOW_PLAYING) {
     if (openGif(gifDraw)) {
       page = PAGE_GIF;
@@ -755,14 +922,19 @@ void switchPage() {
 }
 
 void checkButton() {
-  static bool wasDown = false;
-  static uint32_t lastPress = 0;
+  static uint32_t downAt = 0;
+  static bool held = false;
   bool down = digitalRead(BOOT_BUTTON) == LOW;
-  if (down && !wasDown && millis() - lastPress > 300) {
-    lastPress = millis();
-    switchPage();
+  if (down && !downAt) {
+    downAt = millis();
+    held = false;
+  } else if (down && !held && millis() - downAt >= 1500) {
+    held = true;
+    if (page != PAGE_ACCOUNT) showAccountPage();
+  } else if (!down && downAt) {
+    if (!held && millis() - downAt > 30) switchPage();  // ignore contact bounce
+    downAt = 0;
   }
-  wasDown = down;
 }
 
 // A tap anywhere switches pages; no calibration needed since position doesn't matter
@@ -801,6 +973,7 @@ void setupTouch() {
 void spotifyTask(void*) {
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) waitForWiFi();
+    handleSignIn();
     fetchNowPlaying();
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POLL_MS));  // wakes early after a page switch
   }
@@ -832,17 +1005,20 @@ void setup() {
   Serial.printf("Spotify refresh token: %s\n", refreshToken.length() ? "loaded from flash" : "not set");
   loadNetworks();
   setupWiFi(addNetwork);
-  refreshAccessToken();
+  if (refreshToken.length()) refreshAccessToken();
+  else showAccountPage();  // first run: stays up until someone signs in
   xTaskCreatePinnedToCore(spotifyTask, "spotify", 12288, nullptr, 1, &spotifyTaskHandle, 0);
+  setupWebServer();
 }
 
 // loop() handles touch and animation; all network work happens in spotifyTask
 void loop() {
+  server.handleClient();
   checkButton();
   checkTouch();
   if (page == PAGE_GIF) {
     playGifFrame();
-  } else if (showWave && isPlaying && millis() - lastFrame >= WAVE_FRAME_MS) {
+  } else if (page == PAGE_NOW_PLAYING && showWave && isPlaying && millis() - lastFrame >= WAVE_FRAME_MS) {
     lastFrame = millis();
     xSemaphoreTake(tftLock, portMAX_DELAY);
     drawWave();
