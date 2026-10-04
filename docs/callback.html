@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DeskPlayer sign-in</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 480px; margin: auto; padding: 16px; background: #121212; color: #eee; }
+  a { color: #1DB954; }
+  textarea { width: 100%; box-sizing: border-box; height: 110px; font-size: 14px; border-radius: 8px; padding: 8px; }
+</style>
+</head>
+<body>
+<h2 id="title">Connecting to your DeskPlayer...</h2>
+<div id="fallback" hidden>
+  <p>Couldn't send you back to the display automatically. Make sure your phone is on the same Wi-Fi as the display, then <a id="retry" href="#">try again</a>.</p>
+  <p>Or copy everything below and paste it into the box on the DeskPlayer page:</p>
+  <textarea id="address" readonly></textarea>
+</div>
+<script>
+  // Spotify sends people here after they tap Agree, with ?code= (or ?error=)
+  // and ?state= holding the display's own address on the home network. This
+  // page only forwards the one-time code to that display; nothing is stored.
+  var params = new URLSearchParams(location.search);
+  var device = params.get("state") || "";
+  // Only forward to a display on the local network, never to arbitrary sites
+  var local = /^http:\/\/(deskplayer\.local|10(\.\d{1,3}){3}|192\.168(\.\d{1,3}){2}|172\.(1[6-9]|2\d|3[01])(\.\d{1,3}){2})(:\d+)?$/;
+  var query = params.has("code") ? "code=" + encodeURIComponent(params.get("code"))
+                                 : "error=" + encodeURIComponent(params.get("error") || "unknown");
+  var target = device + "/?" + query;
+
+  document.getElementById("address").value = location.href;
+  document.getElementById("retry").href = local.test(device) ? target : "#";
+  if (local.test(device)) {
+    location.replace(target);
+    // If the display can't be reached, the browser stays here; offer the fallback
+    setTimeout(function () {
+      document.getElementById("title").textContent = "Almost done";
+      document.getElementById("fallback").hidden = false;
+    }, 4000);
+  } else {
+    document.getElementById("title").textContent = "Almost done";
+    document.getElementById("fallback").hidden = false;
+  }
+</script>
+</body>
+</html>

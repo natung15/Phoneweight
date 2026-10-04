@@ -3,6 +3,7 @@
 #include <WiFiManager.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
+#include <qrcode.h>  // ESP-IDF QR encoder, bundled with the ESP32 core
 #include <Preferences.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -50,7 +51,9 @@ volatile bool gifPageDirty = false;     // song or BPM changed while on the GIF 
 
 const char* SETUP_AP = "DeskPlayer-Setup";
 const int PORTAL_TIMEOUT_S = 180;
-const char* SPOTIFY_REDIRECT = "http://127.0.0.1:8888/callback";  // must match the Spotify app
+// docs/callback.html on GitHub Pages: forwards Spotify's sign-in result back to
+// this board. Must be listed under Redirect URIs in the Spotify app's settings.
+const char* SPOTIFY_REDIRECT = "https://natung15.github.io/Phoneweight/callback.html";
 Preferences prefs;
 String refreshToken;  // from the Spotify sign-in page, kept in flash
 
@@ -97,6 +100,57 @@ bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
   return true;
 }
 
+// ---- Loading screen ----
+// A spinner task animates while setup() blocks on Wi-Fi and Spotify. Any other
+// screen stops it first; the task re-checks the flag under tftLock, so it never
+// draws over whatever replaced it.
+volatile bool loadingActive = false;
+const int SPIN_X = SCREEN_W / 2, SPIN_Y = 250, SPIN_R = 26, SPIN_DOTS = 10;
+
+void stopLoading() {
+  loadingActive = false;
+}
+
+// Big "DeskPlayer" title, a spinner, and what it's doing
+void showLoading(const String& message, const String& hint) {
+  xSemaphoreTake(tftLock, portMAX_DELAY);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString("DeskPlayer", SCREEN_W / 2, 140);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString(message, SCREEN_W / 2, SPIN_Y + SPIN_R + 30);
+  String lines[3];
+  int y = SPIN_Y + SPIN_R + 60;
+  tft.setTextColor(TFT_DARKGREY);
+  int n = wrapText(hint, TEXT_W, 3, lines);
+  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
+  tft.setTextDatum(TL_DATUM);
+  loadingActive = true;
+  xSemaphoreGive(tftLock);
+}
+
+void spinnerTask(void*) {
+  uint8_t head = 0;
+  for (;;) {
+    vTaskDelay(pdMS_TO_TICKS(90));
+    if (!loadingActive) continue;
+    xSemaphoreTake(tftLock, portMAX_DELAY);
+    if (loadingActive) {
+      for (int i = 0; i < SPIN_DOTS; i++) {
+        int age = (head - i + SPIN_DOTS) % SPIN_DOTS;  // 0 = leading dot
+        uint16_t c = age == 0 ? SPOTIFY_GREEN : age < 3 ? TFT_LIGHTGREY : age < 6 ? TFT_DARKGREY : 0x2104;
+        float a = 2 * PI * i / SPIN_DOTS;
+        tft.fillCircle(SPIN_X + SPIN_R * sinf(a), SPIN_Y - SPIN_R * cosf(a), 4, c);
+      }
+      head = (head + 1) % SPIN_DOTS;
+    }
+    xSemaphoreGive(tftLock);
+  }
+}
+
 // Centred status text on a black screen, for boot and Wi-Fi setup
 void showStatus(const String& heading, const String& detail, const String& hint) {
   xSemaphoreTake(tftLock, portMAX_DELAY);
@@ -106,6 +160,7 @@ void showStatus(const String& heading, const String& detail, const String& hint)
 
 // Same, for callers already holding tftLock
 void drawStatus(const String& heading, const String& detail, const String& hint) {
+  stopLoading();
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   String lines[4];
@@ -228,27 +283,28 @@ String htmlEscape(String s) {
 String spotifyPage(const String& message) {
   String signInUrl = "https://accounts.spotify.com/authorize?client_id=" + String(SPOTIFY_CLIENT_ID) +
                      "&amp;response_type=code&amp;scope=user-read-currently-playing&amp;show_dialog=true" +
-                     "&amp;redirect_uri=" + urlEncode(SPOTIFY_REDIRECT);
+                     "&amp;redirect_uri=" + urlEncode(SPOTIFY_REDIRECT) +
+                     "&amp;state=" + urlEncode("http://" + WiFi.localIP().toString());  // where to come back to
   String page =
       "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
       "<title>DeskPlayer Spotify</title><style>"
       "body{font-family:-apple-system,sans-serif;max-width:480px;margin:auto;padding:16px;background:#121212;color:#eee}"
       ".btn{display:block;box-sizing:border-box;width:100%;text-align:center;padding:14px;border:0;border-radius:24px;"
       "font-size:18px;font-weight:600;text-decoration:none;background:#1DB954;color:#000}"
-      ".alt{background:#333;color:#eee;margin-top:24px}"
+      "summary{margin-top:28px;color:#aaa}"
       "textarea{width:100%;box-sizing:border-box;height:90px;font-size:15px;border-radius:8px;padding:8px}"
       ".err{background:#5a1d1d;padding:10px;border-radius:8px}</style></head><body>"
       "<h2>Connect Spotify</h2>";
   if (message.length()) page += "<p class='err'>" + htmlEscape(message) + "</p>";
   if (refreshToken.length()) page += "<p>This display already has a Spotify account. Signing in here replaces it.</p>";
   page +=
-      "<p><b>1.</b> Tap the button, sign in, and tap <b>Agree</b>.</p>"
-      "<a class='btn' href='" + signInUrl + "' target='_blank'>Sign in to Spotify</a>"
-      "<p><b>2.</b> The page after that <b>won't load. That's expected.</b> Copy its whole address "
-      "(it starts with http://127.0.0.1), come back to this tab, and paste it here:</p>"
+      "<p>Tap the button, sign in, and tap <b>Agree</b>. You'll come straight back here.</p>"
+      "<a class='btn' href='" + signInUrl + "'>Sign in to Spotify</a>"
+      "<details><summary>Didn't come back?</summary>"
+      "<p>Copy the text from the \"Almost done\" page (or its whole address) and paste it here:</p>"
       "<form method='post' action='/'><textarea name='code' autocapitalize='none' autocorrect='off' "
-      "placeholder='http://127.0.0.1:8888/callback?code=...'></textarea>"
-      "<p><button class='btn' type='submit'>3. Finish</button></p></form>";
+      "placeholder='https://...callback.html?code=...'></textarea>"
+      "<p><button class='btn' type='submit'>Finish</button></p></form></details>";
   return page + "</body></html>";
 }
 
@@ -266,7 +322,22 @@ const char* PAGE_STYLE =
     "-apple-system,sans-serif;max-width:480px;margin:auto;padding:16px;background:#121212;color:#eee'>";
 
 void setupWebServer() {
-  server.on("/", HTTP_GET, []() { server.send(200, "text/html", spotifyPage("")); });
+  server.on("/", HTTP_GET, []() {
+    // Back from Spotify via docs/callback.html with ?code= or ?error=
+    if (server.hasArg("error")) {
+      server.send(200, "text/html", spotifyPage("Spotify sign-in was cancelled"));
+      return;
+    }
+    if (server.hasArg("code") && signIn != SIGNIN_PENDING) {
+      signInEntry = "code=" + server.arg("code");
+      signIn = SIGNIN_PENDING;
+      xTaskNotifyGive(spotifyTaskHandle);
+      server.sendHeader("Location", "/wait");
+      server.send(303);
+      return;
+    }
+    server.send(200, "text/html", spotifyPage(""));
+  });
   server.on("/", HTTP_POST, []() {
     if (signIn != SIGNIN_PENDING) {
       signInEntry = server.arg("code");
@@ -299,6 +370,7 @@ void setupWebServer() {
 // Runs on spotifyTask
 void handleSignIn() {
   if (signIn != SIGNIN_PENDING) return;
+  if (page == PAGE_ACCOUNT) showLoading("Signing in to Spotify...", "");
   String error = applySpotifyEntry(signInEntry);
   if (error.isEmpty()) {
     // New account: drop the old one's song so the screen redraws from scratch
@@ -309,15 +381,60 @@ void handleSignIn() {
   } else {
     signInError = error;
     signIn = SIGNIN_FAILED;
+    xSemaphoreTake(tftLock, portMAX_DELAY);
+    if (page == PAGE_ACCOUNT) drawAccountPage();  // the phone shows what went wrong
+    xSemaphoreGive(tftLock);
   }
 }
 
-// Shows where to find the Spotify page; caller holds tftLock
+// QR codes are drawn from esp_qrcode's callback, which takes no context
+int qrTop, qrBottom;
+const int QR_MAX_PX = 230;
+
+void drawQr(esp_qrcode_handle_t qr) {
+  int n = esp_qrcode_get_size(qr);
+  int scale = min(7, QR_MAX_PX / (n + 8));  // 4-module white border each side
+  int total = (n + 8) * scale, x0 = (SCREEN_W - total) / 2;
+  tft.fillRect(x0, qrTop, total, total, TFT_WHITE);
+  for (int y = 0; y < n; y++)
+    for (int x = 0; x < n; x++)
+      if (esp_qrcode_get_module(qr, x, y))
+        tft.fillRect(x0 + (x + 4) * scale, qrTop + (y + 4) * scale, scale, scale, TFT_BLACK);
+  qrBottom = qrTop + total;
+}
+
+// A QR code for the Spotify page, plus its address for typing; caller holds tftLock
 void drawAccountPage() {
+  stopLoading();
   bool hasAccount = refreshToken.length();
-  drawStatus(hasAccount ? "Switch Spotify account" : "Sign in to Spotify", WiFi.localIP().toString(),
-             String("On your phone, on the same Wi-Fi, open this address (or deskplayer.local).") +
-                 (hasAccount ? " Press BOOT to go back." : ""));
+  String ip = WiFi.localIP().toString();
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(TC_DATUM);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString(hasAccount ? "Switch Spotify account" : "Sign in to Spotify", SCREEN_W / 2, 16);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString("Scan with your phone camera", SCREEN_W / 2, 48);
+
+  qrTop = qrBottom = 76;
+  esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
+  cfg.display_func = drawQr;
+  cfg.qrcode_ecc_level = ESP_QRCODE_ECC_MED;
+  esp_qrcode_generate(&cfg, ("http://" + ip + "/").c_str());
+
+  int y = qrBottom + 12;
+  tft.drawString("or open", SCREEN_W / 2, y);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(SPOTIFY_GREEN);
+  tft.drawString(ip, SCREEN_W / 2, y + 22);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString("deskplayer.local", SCREEN_W / 2, y + 52);
+  tft.setTextColor(TFT_DARKGREY);
+  tft.drawString("Your phone must be on the same Wi-Fi", SCREEN_W / 2, SCREEN_H - 46);
+  if (hasAccount) tft.drawString("Press BOOT to go back", SCREEN_W / 2, SCREEN_H - 24);
+  tft.setTextDatum(TL_DATUM);
 }
 
 void showAccountPage() {
@@ -355,13 +472,13 @@ void setupWiFi(bool addNetwork) {
     wm.resetSettings();  // only the network WiFiManager tries; the saved list stays
     ok = wm.startConfigPortal(SETUP_AP);
   } else {
-    showStatus("Connecting to Wi-Fi...", "", "");
+    showLoading("Connecting to Wi-Fi...", "");
     for (int i = 0; i < 3 && savedCount && !ok; i++) ok = wifiMulti.run(15000) == WL_CONNECTED;
     // Nothing saved in range: try the network WiFiManager last used, then the portal
     if (!ok) ok = wm.autoConnect(SETUP_AP);
   }
   if (!ok && savedCount) {  // portal exited or timed out: fall back to a saved network
-    showStatus("Connecting to Wi-Fi...", "", "");
+    showLoading("Connecting to Wi-Fi...", "");
     WiFi.mode(WIFI_STA);
     ok = wifiMulti.run(15000) == WL_CONNECTED;
   }
@@ -389,7 +506,7 @@ void waitForWiFi() {
 // The BOOT button adds a Wi-Fi network when held for a second just after power-up.
 // (Holding it *while* pressing EN or plugging in starts the flasher instead.)
 bool buttonHeldAtBoot() {
-  showStatus("Starting...", "", "Hold BOOT now to add a Wi-Fi network");
+  showLoading("Starting...", "Hold BOOT now to add a Wi-Fi network");
   uint32_t start = millis(), heldSince = 0;
   while (millis() - start < 2500) {
     if (digitalRead(BOOT_BUTTON) == LOW) {
@@ -549,6 +666,7 @@ void fillBackground() {
 }
 
 void drawInfo(const String& title, const String& artist) {
+  stopLoading();
   fillBackground();
   tft.setTextDatum(TL_DATUM);
   String lines[5];
@@ -654,6 +772,7 @@ bool drawArt(String url) {
     xSemaphoreTake(tftLock, portMAX_DELAY);
     ok = page == PAGE_NOW_PLAYING;  // the user may have switched pages mid-download
     if (ok) {
+      stopLoading();
       tft.fillRect(ART_X, ART_Y, ART_SIZE, ART_SIZE, TFT_BLACK);
       sumR = sumG = sumB = sumN = 0;
       TJpgDec.drawJpg(ART_X, ART_Y, buf, len);
@@ -852,6 +971,7 @@ uint32_t measureGifLoop() {
 }
 
 void drawGifPage() {
+  stopLoading();
   // Match the GIF's own background, with text that stays readable on it
   tft.fillScreen(GIF_BG_COLOR);
   tft.setTextDatum(TC_DATUM);
@@ -897,6 +1017,7 @@ void playGifFrame() {
 
 void switchPage() {
   xSemaphoreTake(tftLock, portMAX_DELAY);
+  stopLoading();
   if (page == PAGE_ACCOUNT && refreshToken.isEmpty()) {
     xSemaphoreGive(tftLock);  // nothing to go back to yet
     return;
@@ -975,6 +1096,11 @@ void spotifyTask(void*) {
     if (WiFi.status() != WL_CONNECTED) waitForWiFi();
     handleSignIn();
     fetchNowPlaying();
+    if (loadingActive && page == PAGE_NOW_PLAYING) {  // first poll had nothing to draw
+      showStatus("Nothing playing", "", "Play something on Spotify and it shows up here");
+      currentArtUrl = "";  // so the next song redraws over this whole screen
+      lastInfo = "";
+    }
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(POLL_MS));  // wakes early after a page switch
   }
 }
@@ -988,6 +1114,7 @@ void setup() {
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(tftOutput);
   tftLock = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(spinnerTask, "spinner", 3072, nullptr, 1, nullptr, 0);
   pinMode(BOOT_BUTTON, INPUT_PULLUP);
   bool addNetwork = buttonHeldAtBoot();
   setupTouch();
@@ -1005,8 +1132,12 @@ void setup() {
   Serial.printf("Spotify refresh token: %s\n", refreshToken.length() ? "loaded from flash" : "not set");
   loadNetworks();
   setupWiFi(addNetwork);
-  if (refreshToken.length()) refreshAccessToken();
-  else showAccountPage();  // first run: stays up until someone signs in
+  if (refreshToken.length()) {
+    showLoading("Loading Spotify...", "");
+    refreshAccessToken();
+  } else {
+    showAccountPage();
+  }  // first run: stays up until someone signs in
   xTaskCreatePinnedToCore(spotifyTask, "spotify", 12288, nullptr, 1, &spotifyTaskHandle, 0);
   setupWebServer();
 }
