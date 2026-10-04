@@ -24,12 +24,44 @@
 #define GETSONGBPM_API_KEY ""  // no key: BPM lookup is skipped and the GIF plays at its own speed
 #endif
 
-// Layout for 320x480 portrait: text on top, art along the bottom
-const int SCREEN_W = 320, SCREEN_H = 480;
-const int ART_SIZE = 300, ART_X = (SCREEN_W - ART_SIZE) / 2, ART_Y = SCREEN_H - ART_SIZE - 10;
-const int TEXT_X = 10, TEXT_Y = 8, TEXT_W = SCREEN_W - 2 * TEXT_X;
-const int WAVE_H = 18, WAVE_Y = ART_Y - 6 - WAVE_H;
-const int BAR_W = 6, BAR_GAP = 4, BAR_COUNT = (TEXT_W + BAR_GAP) / (BAR_W + BAR_GAP);
+TFT_eSPI tft;
+
+// Two layouts, switched at runtime: a short press cycles now playing, then the
+// GIF page, then both again in the other orientation. applyLayout() sets these.
+// Landscape, 480x320: art on the left, text on the right.
+// Portrait, 320x480: text on top, art along the bottom.
+bool landscape = true;
+const int LANDSCAPE_ROTATION = 1;  // use 3 if landscape is upside down
+const int PORTRAIT_ROTATION = 2;   // use 0 if portrait is upside down
+const int ART_SIZE = 300, WAVE_H = 18, BAR_W = 6, BAR_GAP = 4, MAX_BARS = 32;
+int SCREEN_W, SCREEN_H, ART_X, ART_Y, TEXT_X, TEXT_Y, TEXT_W, WAVE_Y, BAR_COUNT;
+int GIF_CX, GIF_CY, INFO_X, INFO_W, INFO_CX, INFO_Y, BPM_Y;  // GIF page; BPM_Y is the pill's centre
+int SPIN_Y, LOGO_Y, STATUS_Y, FULL_W;                        // loading and status screens
+
+void applyLayout() {
+  if (landscape) {
+    SCREEN_W = 480, SCREEN_H = 320;
+    ART_X = 10, ART_Y = 10;
+    TEXT_X = ART_X + ART_SIZE + 12, TEXT_Y = 10, TEXT_W = SCREEN_W - TEXT_X - 10;
+    WAVE_Y = ART_Y + ART_SIZE - WAVE_H;
+    GIF_CX = 135, GIF_CY = SCREEN_H / 2;  // GIF on the left, song and BPM on the right
+    INFO_X = 270, INFO_W = SCREEN_W - INFO_X - 10, INFO_Y = 36, BPM_Y = 228;
+    SPIN_Y = 170, LOGO_Y = 80, STATUS_Y = 70;
+  } else {
+    SCREEN_W = 320, SCREEN_H = 480;
+    ART_X = (SCREEN_W - ART_SIZE) / 2, ART_Y = SCREEN_H - ART_SIZE - 10;
+    TEXT_X = 10, TEXT_Y = 8, TEXT_W = SCREEN_W - 2 * TEXT_X;
+    WAVE_Y = ART_Y - 6 - WAVE_H;
+    GIF_CX = SCREEN_W / 2, GIF_CY = 255;  // song on top, GIF in the middle, BPM at the bottom
+    INFO_X = TEXT_X, INFO_W = TEXT_W, INFO_Y = 14, BPM_Y = SCREEN_H - 78;
+    SPIN_Y = 250, LOGO_Y = 140, STATUS_Y = 150;
+  }
+  INFO_CX = INFO_X + INFO_W / 2;
+  FULL_W = SCREEN_W - 20;  // text width on full-screen messages
+  BAR_COUNT = min(MAX_BARS, (TEXT_W + BAR_GAP) / (BAR_W + BAR_GAP));
+  tft.setRotation(landscape ? LANDSCAPE_ROTATION : PORTRAIT_ROTATION);
+}
+
 const uint32_t WAVE_FRAME_MS = 80;
 const uint32_t POLL_MS = 5000;
 const uint16_t TOUCH_Z_MIN = 600;  // raw touch pressure that counts as a tap
@@ -38,7 +70,6 @@ const uint16_t TOUCH_Z_MIN = 600;  // raw touch pressure that counts as a tap
 // Wi-Fi network
 const int BOOT_BUTTON = 0;
 
-TFT_eSPI tft;
 // Spotify polling runs as its own task on core 0 so the wave and GIF keep moving
 // during slow HTTPS requests; this lock keeps the two from drawing at once
 SemaphoreHandle_t tftLock;
@@ -68,10 +99,25 @@ String accessToken;
 uint32_t tokenFetchedAt = 0, tokenTtlMs = 0;
 String currentArtUrl, lastInfo, bpmKey;
 String curTitle, curArtist;  // shared with the GIF page; guarded by tftLock
+// Playback position, for the progress bar (landscape)
+volatile uint32_t progressMs = 0, durationMs = 0, progressAt = 0;
+int progressPx = -1, progressSec = -1;  // what the bar shows now; -1 = redraw it all
+
+// A title too wide for its line scrolls: it waits, slides the full name past
+// once, and waits again. It's drawn into a 1-bit sprite first so it doesn't flicker.
+TFT_eSprite titleSprite(&tft);
+struct {
+  bool on = false;
+  String text;
+  int x, y, textW, offset;
+  uint32_t pauseFrom, lastStep;
+  const GFXfont* font;
+} marquee;
+const int MARQUEE_GAP = 60, MARQUEE_PAUSE_MS = 3000, MARQUEE_STEP_MS = 20;
 volatile bool isPlaying = false, showWave = false;
 volatile int bpm = 0;  // 0 = unknown
 uint32_t lastFrame = 0;
-uint8_t barH[BAR_COUNT];  // height each bar is currently drawn at
+uint8_t barH[MAX_BARS];  // height each bar is currently drawn at
 bool touchOk = false;
 
 // The GIF decoder needs ~22 KB, so it only exists while its page is showing
@@ -79,7 +125,7 @@ AnimatedGIF* gif = nullptr;
 int gifX, gifY;
 uint32_t gifLoopMs = 0;  // one loop at the GIF's own speed
 uint32_t nextFrameAt = 0;
-uint16_t gifLine[SCREEN_W];
+uint16_t gifLine[480];  // one line of the widest layout
 
 const uint16_t SPOTIFY_GREEN = 0x1DCA;  // #1DB954
 uint16_t panelBg = TFT_BLACK;           // darkened average colour of the current art
@@ -105,7 +151,7 @@ bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
 // screen stops it first; the task re-checks the flag under tftLock, so it never
 // draws over whatever replaced it.
 volatile bool loadingActive = false;
-const int SPIN_X = SCREEN_W / 2, SPIN_Y = 250, SPIN_R = 26, SPIN_DOTS = 10;
+const int SPIN_R = 26, SPIN_DOTS = 10;
 
 void stopLoading() {
   loadingActive = false;
@@ -114,18 +160,19 @@ void stopLoading() {
 // Big "DeskPlayer" title, a spinner, and what it's doing
 void showLoading(const String& message, const String& hint) {
   xSemaphoreTake(tftLock, portMAX_DELAY);
+  marquee.on = false;
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setFreeFont(&FreeSansBold18pt7b);
   tft.setTextColor(TFT_WHITE);
-  tft.drawString("DeskPlayer", SCREEN_W / 2, 140);
+  tft.drawString("DeskPlayer", SCREEN_W / 2, LOGO_Y);
   tft.setFreeFont(&FreeSans9pt7b);
   tft.setTextColor(TFT_LIGHTGREY);
   tft.drawString(message, SCREEN_W / 2, SPIN_Y + SPIN_R + 30);
   String lines[3];
   int y = SPIN_Y + SPIN_R + 60;
   tft.setTextColor(TFT_DARKGREY);
-  int n = wrapText(hint, TEXT_W, 3, lines);
+  int n = wrapText(hint, FULL_W, 3, lines);
   for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
   tft.setTextDatum(TL_DATUM);
   loadingActive = true;
@@ -143,7 +190,7 @@ void spinnerTask(void*) {
         int age = (head - i + SPIN_DOTS) % SPIN_DOTS;  // 0 = leading dot
         uint16_t c = age == 0 ? SPOTIFY_GREEN : age < 3 ? TFT_LIGHTGREY : age < 6 ? TFT_DARKGREY : 0x2104;
         float a = 2 * PI * i / SPIN_DOTS;
-        tft.fillCircle(SPIN_X + SPIN_R * sinf(a), SPIN_Y - SPIN_R * cosf(a), 4, c);
+        tft.fillCircle(SCREEN_W / 2 + SPIN_R * sinf(a), SPIN_Y - SPIN_R * cosf(a), 4, c);
       }
       head = (head + 1) % SPIN_DOTS;
     }
@@ -161,13 +208,14 @@ void showStatus(const String& heading, const String& detail, const String& hint)
 // Same, for callers already holding tftLock
 void drawStatus(const String& heading, const String& detail, const String& hint) {
   stopLoading();
+  marquee.on = false;
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   String lines[4];
-  int y = 150;
+  int y = STATUS_Y;
   tft.setFreeFont(&FreeSansBold12pt7b);
   tft.setTextColor(TFT_WHITE);
-  int n = wrapText(heading, TEXT_W, 4, lines);
+  int n = wrapText(heading, FULL_W, 4, lines);
   for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
   y += 12;
   tft.setFreeFont(&FreeSansBold18pt7b);
@@ -178,7 +226,7 @@ void drawStatus(const String& heading, const String& detail, const String& hint)
   }
   tft.setFreeFont(&FreeSans9pt7b);
   tft.setTextColor(TFT_LIGHTGREY);
-  n = wrapText(hint, TEXT_W, 4, lines);
+  n = wrapText(hint, FULL_W, 4, lines);
   for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
   tft.setTextDatum(TL_DATUM);
 }
@@ -388,13 +436,13 @@ void handleSignIn() {
 }
 
 // QR codes are drawn from esp_qrcode's callback, which takes no context
-int qrTop, qrBottom;
-const int QR_MAX_PX = 230;
+int qrTop, qrBottom, qrAreaX, qrAreaW;
+
 
 void drawQr(esp_qrcode_handle_t qr) {
   int n = esp_qrcode_get_size(qr);
-  int scale = min(7, QR_MAX_PX / (n + 8));  // 4-module white border each side
-  int total = (n + 8) * scale, x0 = (SCREEN_W - total) / 2;
+  int scale = min(7, (landscape ? 280 : 230) / (n + 8));  // 4-module white border each side
+  int total = (n + 8) * scale, x0 = qrAreaX + (qrAreaW - total) / 2;
   tft.fillRect(x0, qrTop, total, total, TFT_WHITE);
   for (int y = 0; y < n; y++)
     for (int x = 0; x < n; x++)
@@ -406,23 +454,59 @@ void drawQr(esp_qrcode_handle_t qr) {
 // A QR code for the Spotify page, plus its address for typing; caller holds tftLock
 void drawAccountPage() {
   stopLoading();
+  marquee.on = false;
   bool hasAccount = refreshToken.length();
   String ip = WiFi.localIP().toString();
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.setTextColor(TFT_WHITE);
-  tft.drawString(hasAccount ? "Switch Spotify account" : "Sign in to Spotify", SCREEN_W / 2, 16);
-  tft.setFreeFont(&FreeSans9pt7b);
-  tft.setTextColor(TFT_LIGHTGREY);
-  tft.drawString("Scan with your phone camera", SCREEN_W / 2, 48);
-
-  qrTop = qrBottom = 76;
   esp_qrcode_config_t cfg = ESP_QRCODE_CONFIG_DEFAULT();
   cfg.display_func = drawQr;
   cfg.qrcode_ecc_level = ESP_QRCODE_ECC_MED;
-  esp_qrcode_generate(&cfg, ("http://" + ip + "/").c_str());
-
+  String url = "http://" + ip + "/";
+  const char* heading = hasAccount ? "Switch Spotify account" : "Sign in to Spotify";
+  String lines[3];
+  if (landscape) {
+  // QR on the left, words in a column on the right
+  qrAreaX = 0;
+  qrAreaW = 300;
+  qrTop = 20;
+  esp_qrcode_generate(&cfg, url.c_str());
+  const int cx = 385, colW = SCREEN_W - 300 - 10;
+  int y = 24;
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(TFT_WHITE);
+  int n = wrapText(heading, colW, 2, lines);
+  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], cx, y);
+  y += 8;
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  n = wrapText("Scan with your phone camera", colW, 2, lines);
+  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], cx, y);
+  y += 14;
+  tft.drawString("or open", cx, y);
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(SPOTIFY_GREEN);
+  tft.drawString(ip, cx, y + 22);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString("deskplayer.local", cx, y + 52);
+  tft.setTextColor(TFT_DARKGREY);
+  n = wrapText("Phone must be on the same Wi-Fi", colW, 2, lines);
+  y = SCREEN_H - 20 - (n + hasAccount) * tft.fontHeight();
+  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], cx, y);
+  if (hasAccount) tft.drawString("Press BOOT to go back", cx, y);
+  } else {
+  // Heading, QR, then the address underneath
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(TFT_WHITE);
+  tft.drawString(heading, SCREEN_W / 2, 16);
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString("Scan with your phone camera", SCREEN_W / 2, 48);
+  qrAreaX = 0;
+  qrAreaW = SCREEN_W;
+  qrTop = qrBottom = 76;
+  esp_qrcode_generate(&cfg, url.c_str());
   int y = qrBottom + 12;
   tft.drawString("or open", SCREEN_W / 2, y);
   tft.setFreeFont(&FreeSansBold12pt7b);
@@ -434,6 +518,7 @@ void drawAccountPage() {
   tft.setTextColor(TFT_DARKGREY);
   tft.drawString("Your phone must be on the same Wi-Fi", SCREEN_W / 2, SCREEN_H - 46);
   if (hasAccount) tft.drawString("Press BOOT to go back", SCREEN_W / 2, SCREEN_H - 24);
+  }
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -665,7 +750,178 @@ void fillBackground() {
   tft.fillRect(artRight, ART_Y, tft.width() - artRight, ART_SIZE, panelBg);
 }
 
-void drawInfo(const String& title, const String& artist) {
+const uint16_t SPOTIFY_GREY = 0xB596;  // #B3B3B3, Spotify's secondary text
+
+void renderMarquee() {
+  titleSprite.fillSprite(0);
+  titleSprite.setFreeFont(marquee.font);
+  titleSprite.setTextColor(1);
+  titleSprite.setTextDatum(TL_DATUM);
+  titleSprite.drawString(marquee.text, -marquee.offset, 0);
+  titleSprite.drawString(marquee.text, marquee.textW + MARQUEE_GAP - marquee.offset, 0);  // wraps round
+  titleSprite.setBitmapColor(TFT_WHITE, panelBg);
+  titleSprite.pushSprite(marquee.x, marquee.y);
+}
+
+// The title on one line at (x, y); scrolls if it's wider than TEXT_W. Caller holds tftLock.
+void drawTitle(const String& title, int x, int y, const GFXfont* font) {
+  marquee.on = false;
+  tft.setFreeFont(font);
+  tft.setTextColor(TFT_WHITE);
+  int w = tft.textWidth(title), h = tft.fontHeight();
+  if (w <= TEXT_W) {
+    tft.drawString(title, x, y);
+    return;
+  }
+  if (titleSprite.created() && (titleSprite.height() != h || titleSprite.width() != TEXT_W)) titleSprite.deleteSprite();
+  if (!titleSprite.created()) {
+    titleSprite.setColorDepth(1);
+    if (!titleSprite.createSprite(TEXT_W, h)) {  // no memory: cut it off instead
+      String line[1];
+      wrapText(title, TEXT_W, 1, line);
+      tft.drawString(line[0], x, y);
+      return;
+    }
+  }
+  marquee.text = title;
+  marquee.x = x;
+  marquee.y = y;
+  marquee.textW = w;
+  marquee.offset = 0;
+  marquee.font = font;
+  marquee.pauseFrom = millis();
+  marquee.on = true;
+  renderMarquee();
+}
+
+// Called from loop() under tftLock
+void stepMarquee() {
+  if (!marquee.on) return;
+  uint32_t now = millis();
+  if (marquee.offset == 0 && now - marquee.pauseFrom < MARQUEE_PAUSE_MS) return;
+  if (now - marquee.lastStep < MARQUEE_STEP_MS) return;
+  marquee.lastStep = now;
+  if (++marquee.offset >= marquee.textW + MARQUEE_GAP) {  // back at the start: pause again
+    marquee.offset = 0;
+    marquee.pauseFrom = now;
+  }
+  renderMarquee();
+}
+
+void drawInfo(const String& title, const String& artist, const String& album) {
+  if (landscape) drawInfoLandscape(title, artist, album);
+  else drawInfoPortrait(title, artist);
+}
+
+// Landscape progress bar; the elapsed and total times sit under it
+int progressY() {
+  return WAVE_Y - 40;
+}
+
+// Right-hand column: label, then title, artists and album centred in the space
+// above the progress bar and wave
+void drawInfoLandscape(const String& title, const String& artist, const String& album) {
+  stopLoading();
+  fillBackground();
+  tft.setTextDatum(TL_DATUM);
+
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_LIGHTGREY);
+  tft.drawString("NOW PLAYING", TEXT_X, TEXT_Y);
+  const char* state = isPlaying ? "Playing" : "Paused";
+  int right = TEXT_X + TEXT_W;
+  tft.fillCircle(right - tft.textWidth(state) - 9, TEXT_Y + 8, 4, isPlaying ? SPOTIFY_GREEN : TFT_DARKGREY);
+  tft.setTextColor(isPlaying ? TFT_WHITE : TFT_LIGHTGREY);
+  tft.setTextDatum(TR_DATUM);
+  tft.drawString(state, right, TEXT_Y);
+  tft.setTextDatum(TL_DATUM);
+
+  // Title on one big line (it scrolls if it's too long), then artists and album
+  String artistLines[6], albumLines[2];
+  tft.setFreeFont(&FreeSansBold18pt7b);
+  int titleH = tft.fontHeight();
+  const GFXfont* artistFont = &FreeSans12pt7b;
+  tft.setFreeFont(artistFont);
+  int nArtist = wrapText(artist, TEXT_W, 6, artistLines);
+  if (nArtist > 2) {
+    artistFont = &FreeSans9pt7b;
+    tft.setFreeFont(artistFont);
+    nArtist = wrapText(artist, TEXT_W, 3, artistLines);
+  }
+  int artistH = tft.fontHeight();
+  tft.setFreeFont(&FreeSans9pt7b);
+  int albumH = tft.fontHeight();
+  int nAlbum = wrapText(album, TEXT_W, 1, albumLines);
+
+  int top = TEXT_Y + 26, bottom = progressY() - 10;
+  int blockH = titleH + 6 + nArtist * artistH + (nAlbum ? 8 + albumH : 0);
+  // Drop the album if everything doesn't fit
+  if (blockH > bottom - top && nAlbum) {
+    blockH -= 8 + albumH;
+    nAlbum = 0;
+  }
+  int y = top + max(0, (bottom - top - blockH) / 2);
+
+  drawTitle(title, TEXT_X, y, &FreeSansBold18pt7b);
+  y += titleH + 6;
+  tft.setFreeFont(artistFont);
+  tft.setTextColor(SPOTIFY_GREY);
+  for (int i = 0; i < nArtist; i++, y += artistH) tft.drawString(artistLines[i], TEXT_X, y);
+  if (nAlbum) {
+    y += 8;
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(TFT_DARKGREY);
+    tft.drawString(albumLines[0], TEXT_X, y);
+  }
+
+  progressPx = progressSec = -1;  // the background fill wiped the bar too
+  drawProgress();
+  memset(barH, 0, sizeof(barH));
+  drawWave();
+}
+
+String formatTime(uint32_t ms) {
+  uint32_t s = ms / 1000;
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%u:%02u", s / 60, s % 60);
+  return buf;
+}
+
+// Spotify reports the position at each poll; in between, count forward while
+// playing. Only the parts that changed are redrawn. Caller holds tftLock.
+void drawProgress() {
+  uint32_t dur = durationMs;
+  if (!landscape || !dur) return;
+  uint32_t pos = progressMs + (isPlaying ? millis() - progressAt : 0);
+  if (pos > dur) pos = dur;
+  int px = (uint64_t)TEXT_W * pos / dur;
+  int sec = pos / 1000;
+  if (px == progressPx && sec == progressSec) return;
+  if (progressPx < 0) {  // first draw: track, then the total time on the right
+    tft.fillRoundRect(TEXT_X, progressY(), TEXT_W, 4, 2, 0x4208);
+    tft.setTextFont(2);
+    tft.setTextColor(SPOTIFY_GREY, panelBg);
+    tft.setTextDatum(TR_DATUM);
+    tft.drawString(formatTime(dur), TEXT_X + TEXT_W, progressY() + 9);
+    tft.setTextDatum(TL_DATUM);
+    progressPx = 0;
+  }
+  if (px > progressPx) tft.fillRoundRect(TEXT_X, progressY(), px, 4, 2, TFT_WHITE);
+  else if (px < progressPx) {  // jumped back (seek or new song): redraw the track
+    tft.fillRoundRect(TEXT_X, progressY(), TEXT_W, 4, 2, 0x4208);
+    if (px) tft.fillRoundRect(TEXT_X, progressY(), px, 4, 2, TFT_WHITE);
+  }
+  progressPx = px;
+  if (sec != progressSec) {
+    tft.setTextFont(2);
+    tft.setTextColor(SPOTIFY_GREY, panelBg);
+    tft.setTextPadding(tft.textWidth("88:88"));
+    tft.drawString(formatTime(pos), TEXT_X, progressY() + 9);
+    tft.setTextPadding(0);
+    progressSec = sec;
+  }
+}
+void drawInfoPortrait(const String& title, const String& artist) {
   stopLoading();
   fillBackground();
   tft.setTextDatum(TL_DATUM);
@@ -683,12 +939,12 @@ void drawInfo(const String& title, const String& artist) {
   tft.drawString(state, right, TEXT_Y);
   tft.setTextDatum(TL_DATUM);
 
-  // Title (up to 3 lines), then artists in whatever space is left above the art
-  int y = TEXT_Y + 20;
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.setTextColor(TFT_WHITE);
-  int n = wrapText(title, TEXT_W, 3, lines);
-  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], TEXT_X, y);
+  // Title on one big line (it scrolls if it's too long), then artists in
+  // whatever space is left above the art
+  int y = TEXT_Y + 22;
+  drawTitle(title, TEXT_X, y, &FreeSansBold18pt7b);
+  y += tft.fontHeight();
+  int n;
 
   y += 4;
   tft.setFreeFont(&FreeSans9pt7b);
@@ -832,6 +1088,9 @@ void fetchNowPlaying() {
   filter["item"]["artists"][0]["name"] = true;
   filter["item"]["album"]["images"][0]["url"] = true;
   filter["item"]["album"]["images"][0]["width"] = true;
+  filter["item"]["album"]["name"] = true;
+  filter["item"]["duration_ms"] = true;
+  filter["progress_ms"] = true;
 
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
@@ -845,7 +1104,11 @@ void fetchNowPlaying() {
   }
 
   isPlaying = doc["is_playing"] | false;
+  progressMs = doc["progress_ms"] | 0;
+  durationMs = doc["item"]["duration_ms"] | 0;
+  progressAt = millis();
   String title = doc["item"]["name"] | "";
+  String album = doc["item"]["album"]["name"] | "";
   String firstArtist = doc["item"]["artists"][0]["name"] | "";
   String artist;
   for (JsonObject a : doc["item"]["artists"].as<JsonArray>()) {
@@ -887,7 +1150,7 @@ void fetchNowPlaying() {
   if (newArt || info != lastInfo) {
     xSemaphoreTake(tftLock, portMAX_DELAY);
     if (page == PAGE_NOW_PLAYING) {
-      drawInfo(title, artist);
+      drawInfo(title, artist, album);
       showWave = true;
     }
     xSemaphoreGive(tftLock);
@@ -945,8 +1208,8 @@ bool openGif(GIF_DRAW_CALLBACK* draw) {
     return false;
   }
   // Centre it in the space between the title (top) and the BPM (bottom)
-  gifX = (SCREEN_W - gif->getCanvasWidth()) / 2;
-  gifY = 255 - gif->getCanvasHeight() / 2;
+  gifX = GIF_CX - gif->getCanvasWidth() / 2;
+  gifY = GIF_CY - gif->getCanvasHeight() / 2;
   return true;
 }
 
@@ -970,25 +1233,88 @@ uint32_t measureGifLoop() {
   return total;
 }
 
+// GIF page colours. The GIF sits on a card in its own background colour, so
+// its edges disappear, on a page a shade darker (or black for dark GIFs).
+const uint16_t GP_BG = GIF_BG_LIGHT ? 0xEF5D : TFT_BLACK;      // #EBEBEB
+const uint16_t GP_SHADOW = GIF_BG_LIGHT ? 0xD69A : 0x2104;
+const uint16_t GP_TEXT = GIF_BG_LIGHT ? 0x18C3 : TFT_WHITE;    // #181818
+const uint16_t GP_MUTED = GIF_BG_LIGHT ? 0x6B4D : SPOTIFY_GREY;
+const uint16_t GP_DOT = GIF_BG_LIGHT ? 0xC618 : 0x4208;
+const int BEAT_DOTS = 4;
+uint32_t gifLoopStart = 0;  // when the current loop of the GIF began, for the beat dots
+int shownBeat = -1;
+
 void drawGifPage() {
   stopLoading();
-  // Match the GIF's own background, with text that stays readable on it
-  tft.fillScreen(GIF_BG_COLOR);
-  tft.setTextDatum(TC_DATUM);
-  String lines[2];
-  int y = 12;
-  tft.setFreeFont(&FreeSansBold12pt7b);
-  tft.setTextColor(GIF_BG_LIGHT ? TFT_BLACK : TFT_WHITE);
-  int n = wrapText(curTitle, TEXT_W, 2, lines);
-  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], SCREEN_W / 2, y);
-  tft.setFreeFont(&FreeSans9pt7b);
-  tft.setTextColor(GIF_BG_LIGHT ? TFT_DARKGREY : TFT_LIGHTGREY);
-  if (wrapText(curArtist, TEXT_W, 1, lines)) tft.drawString(lines[0], SCREEN_W / 2, y);
+  tft.fillScreen(GP_BG);
 
-  tft.setFreeFont(&FreeSansBold18pt7b);
-  tft.setTextColor(bpm ? SPOTIFY_GREEN : TFT_DARKGREY);
-  tft.drawString(bpm ? String(bpm) + " BPM" : String("BPM unknown"), SCREEN_W / 2, SCREEN_H - 56);
+  // The card behind the GIF, with a soft drop shadow
+  int gw = gif ? gif->getCanvasWidth() : 200, gh = gif ? gif->getCanvasHeight() : 200;
+  int pad = 12, cw = gw + 2 * pad, ch = gh + 2 * pad;
+  int cx = GIF_CX - cw / 2, cy = GIF_CY - ch / 2;
+  tft.fillRoundRect(cx + 2, cy + 4, cw, ch, 18, GP_SHADOW);
+  tft.fillRoundRect(cx, cy, cw, ch, 18, GIF_BG_COLOR);
+
+  // Label, title and artist
+  tft.setTextDatum(TC_DATUM);
+  String lines[3];
+  int y = INFO_Y;
+  tft.setTextFont(2);
+  tft.setTextColor(SPOTIFY_GREEN);
+  tft.drawString("NOW DANCING TO", INFO_CX, y);
+  y += 22;
+  tft.setFreeFont(&FreeSansBold12pt7b);
+  tft.setTextColor(GP_TEXT);
+  int n = wrapText(curTitle, INFO_W, landscape ? 3 : 2, lines);
+  for (int i = 0; i < n; i++, y += tft.fontHeight()) tft.drawString(lines[i], INFO_CX, y);
+  y += 2;
+  tft.setFreeFont(&FreeSans9pt7b);
+  tft.setTextColor(GP_MUTED);
+  if (wrapText(curArtist, INFO_W, 1, lines)) tft.drawString(lines[0], INFO_CX, y);
+
+  // BPM pill: big number and a small label, or a muted outline when unknown
+  const int pillW = min(INFO_W, 190), pillH = 54, px = INFO_CX - pillW / 2, py = BPM_Y - pillH / 2;
+  if (bpm) {
+    tft.fillRoundRect(px, py, pillW, pillH, pillH / 2, SPOTIFY_GREEN);
+    tft.setFreeFont(&FreeSansBold18pt7b);
+    String num = String(bpm);
+    int numW = tft.textWidth(num);
+    tft.setTextFont(2);
+    int labelW = tft.textWidth("BPM");
+    int x = INFO_CX - (numW + 8 + labelW) / 2;  // number and label centred as a pair
+    tft.setTextDatum(ML_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.setFreeFont(&FreeSansBold18pt7b);
+    tft.drawString(num, x, BPM_Y + 2);
+    tft.setTextFont(2);
+    tft.drawString("BPM", x + numW + 8, BPM_Y + 5);
+  } else {
+    tft.drawRoundRect(px, py, pillW, pillH, pillH / 2, GP_MUTED);
+    tft.setTextDatum(MC_DATUM);
+    tft.setFreeFont(&FreeSans9pt7b);
+    tft.setTextColor(GP_MUTED);
+    tft.drawString("Tempo unknown", INFO_CX, BPM_Y);
+  }
   tft.setTextDatum(TL_DATUM);
+  gifLoopStart = millis();
+  shownBeat = -1;
+  drawBeatDots();
+}
+
+// Four dots under the pill that light up in turn, one per beat, in step with
+// the GIF (each loop of it lasts GIF_BEATS_PER_LOOP beats). Caller holds tftLock.
+void drawBeatDots() {
+  if (!bpm) return;
+  int beat = (uint64_t)(millis() - gifLoopStart) * bpm / 60000 % BEAT_DOTS;
+  if (beat == shownBeat) return;
+  int y = BPM_Y + 27 + 18, gap = 20, x0 = INFO_CX - gap * (BEAT_DOTS - 1) / 2;
+  for (int i = 0; i < BEAT_DOTS; i++) {
+    int x = x0 + i * gap;
+    tft.fillCircle(x, y, 6, GP_BG);
+    if (i == beat) tft.fillCircle(x, y, 6, SPOTIFY_GREEN);
+    else tft.fillCircle(x, y, 4, GP_DOT);
+  }
+  shownBeat = beat;
 }
 
 void playGifFrame() {
@@ -1003,8 +1329,12 @@ void playGifFrame() {
   tft.startWrite();
   int more = gif->playFrame(false, &ms);
   tft.endWrite();
+  drawBeatDots();
   xSemaphoreGive(tftLock);
-  if (more <= 0) gif->reset();
+  if (more <= 0) {
+    gif->reset();
+    gifLoopStart = millis();  // keep the dots in step with the dance
+  }
 
   // Stretch or squeeze every frame so one loop lasts GIF_BEATS_PER_LOOP beats
   uint32_t wait = frameDelay(ms);
@@ -1018,6 +1348,7 @@ void playGifFrame() {
 void switchPage() {
   xSemaphoreTake(tftLock, portMAX_DELAY);
   stopLoading();
+  marquee.on = false;
   if (page == PAGE_ACCOUNT && refreshToken.isEmpty()) {
     xSemaphoreGive(tftLock);  // nothing to go back to yet
     return;
@@ -1032,13 +1363,19 @@ void switchPage() {
       Serial.println("Not enough memory to open the GIF");
     }
   } else {
+    if (page == PAGE_GIF) {  // done with this orientation: flip to the other one
+      landscape = !landscape;
+      applyLayout();
+      prefs.putBool("landscape", landscape);
+    }
     closeGif();
     page = PAGE_NOW_PLAYING;
     tft.fillScreen(panelBg);
     forceRedraw = true;
   }
   xSemaphoreGive(tftLock);
-  Serial.printf("Page: %s, free heap %u\n", page == PAGE_GIF ? "GIF" : "now playing", ESP.getFreeHeap());
+  Serial.printf("Page: %s (%s), free heap %u\n", page == PAGE_GIF ? "GIF" : "now playing",
+                landscape ? "landscape" : "portrait", ESP.getFreeHeap());
   if (page == PAGE_NOW_PLAYING) xTaskNotifyGive(spotifyTaskHandle);  // redraw now, not at the next poll
 }
 
@@ -1108,8 +1445,10 @@ void spotifyTask(void*) {
 void setup() {
   Serial.begin(115200);
   Serial.printf("\nSpotifyDesk, PSRAM: %u bytes\n", ESP.getPsramSize());
+  prefs.begin("deskplayer");
+  landscape = prefs.getBool("landscape", true);
   tft.init();
-  tft.setRotation(2);  // portrait, 320x480; use 0 if it's upside down
+  applyLayout();
   tft.fillScreen(TFT_BLACK);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setCallback(tftOutput);
@@ -1120,7 +1459,6 @@ void setup() {
   setupTouch();
   gifLoopMs = measureGifLoop();
   Serial.printf("GIF loop: %u ms, %d beat(s)\n", gifLoopMs, GIF_BEATS_PER_LOOP);
-  prefs.begin("deskplayer");
   refreshToken = prefs.getString("refresh", "");
 #ifdef SPOTIFY_REFRESH_TOKEN  // one-time seed: flash once with it in secrets.h, then remove it
   if (refreshToken.isEmpty()) {
@@ -1149,10 +1487,18 @@ void loop() {
   checkTouch();
   if (page == PAGE_GIF) {
     playGifFrame();
-  } else if (page == PAGE_NOW_PLAYING && showWave && isPlaying && millis() - lastFrame >= WAVE_FRAME_MS) {
+  } else if (page == PAGE_NOW_PLAYING && showWave && millis() - lastFrame >= WAVE_FRAME_MS) {
     lastFrame = millis();
     xSemaphoreTake(tftLock, portMAX_DELAY);
-    drawWave();
+    if (page == PAGE_NOW_PLAYING) {
+      if (isPlaying) drawWave();
+      drawProgress();  // also while paused, in case the song was skipped through
+    }
+    xSemaphoreGive(tftLock);
+  }
+  if (page == PAGE_NOW_PLAYING && marquee.on) {
+    xSemaphoreTake(tftLock, portMAX_DELAY);
+    if (page == PAGE_NOW_PLAYING) stepMarquee();
     xSemaphoreGive(tftLock);
   }
   delay(2);
